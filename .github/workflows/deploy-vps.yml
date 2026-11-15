@@ -12,10 +12,20 @@ permissions:
 jobs:
   deploy:
     if: >-
-      (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success')
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.head_repository.id == github.event.repository.id &&
+        contains(fromJSON('["push","release","workflow_dispatch"]'), github.event.workflow_run.event) &&
+        (github.event.workflow_run.head_branch == 'main' ||
+         startsWith(github.event.workflow_run.head_branch, 'release/v') ||
+         startsWith(github.event.workflow_run.head_branch, 'v'))))
       && vars.DEPLOY_ENABLED == 'true'
+      && !startsWith(github.event.workflow_run.head_branch, 'omni-queue/') && !startsWith(github.ref, 'refs/heads/omni-queue/')
     name: Deploy OmniRoute to VPS
     runs-on: ubuntu-latest
+    # Bound a hung SSH session to an hour instead of GitHub's 6-hour default; the deploy
+    # itself fails fast when the VPS is unreachable (run 39101148517: 0 min of work).
+    timeout-minutes: 60
     steps:
       - name: Check VPS SSH reachability from runner
         id: reach
@@ -24,27 +34,25 @@ jobs:
           # script body) so /dev/tcp gets a shell variable, not inlined text.
           VPS_HOST: ${{ secrets.VPS_HOST }}
         run: |
-          set -uo pipefail
+          set -euo pipefail
           # A GitHub-hosted runner can only deploy when it can actually open a TCP
           # connection to the VPS SSH port. The Local VPS lives on a private LAN and
           # the Akamai host firewalls :22 to known IPs, so the runner is routinely
-          # unable to reach it (`dial tcp ***:22: i/o timeout`). Treat "unreachable
-          # from the runner" as a SKIP — the real deploys are run manually from an
-          # allowed network via the deploy-vps-local / deploy-vps-akamai skills — so
-          # an unreachable host no longer red-fails every release/push pipeline.
-          # When the host IS reachable, the deploy step below still runs in full and
-          # its health gate surfaces any genuine deploy failure.
+          # unable to reach it. An enabled deployment that cannot start is a failed
+          # deployment, not success. Keep DEPLOY_ENABLED=false when this runner has
+          # no authorized route; do not convert a requested deployment into green.
           if timeout 15 bash -c 'exec 3<>"/dev/tcp/${VPS_HOST}/22"' 2>/dev/null; then
             echo "reachable=true" >> "$GITHUB_OUTPUT"
             echo "✅ VPS_HOST:22 reachable from the runner — proceeding with deploy."
           else
             echo "reachable=false" >> "$GITHUB_OUTPUT"
-            echo "::warning title=Auto-deploy skipped::VPS_HOST:22 is not reachable from this GitHub runner (private LAN / firewalled). Deploy manually with the deploy-vps-local or deploy-vps-akamai skill."
+            echo "::error title=Deployment did not start::VPS_HOST:22 is not reachable from this runner. An operator must provide an authorized route or perform a separately authorized deployment."
+            exit 1
           fi
 
       - name: Deploy via SSH
         if: steps.reach.outputs.reachable == 'true'
-        uses: appleboy/ssh-action@v1
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
